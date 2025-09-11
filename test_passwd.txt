@@ -1,0 +1,16 @@
+#!/usr/bin/expect -f
+
+set user "testuser"
+set pwlist {"password" "Password123" "Password123!" "UltraSecure2025!" "Abc!12345678Xyz"}
+
+foreach pw $pwlist {
+    spawn passwd $user
+    expect "Nouveau mot de passe :"
+    send "$pw\r"
+    expect "Retapez le nouveau mot de passe :"
+    send "$pw\r"
+    expect {
+        -re "incorrect" { puts "[INVALIDE] $pw" }
+        -re "succès"    { puts "[VALIDE]   $pw" }
+    }
+}
