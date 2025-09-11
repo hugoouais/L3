@@ -1,16 +1,108 @@
-#!/usr/bin/expect -f
+#!/usr/bin/env bash
+# test_pwquality.sh — Teste la politique pwquality via passwd + expect
+# Nécessite: sudo/root, libpam-pwquality, expect, ligne pam_pwquality dans /etc/pam.d/common-password
 
-set user "testuser"
-set pwlist {"password" "Password123" "Password123!" "UltraSecure2025!" "Abc!12345678Xyz"}
+set -euo pipefail
 
-foreach pw $pwlist {
+# --- Vérifs préalables -------------------------------------------------------
+if [ "$EUID" -ne 0 ]; then
+  echo "Erreur: lance ce script en root (ou avec sudo)." >&2
+  exit 1
+fi
+
+# Installe expect et libpam-pwquality si absents
+command -v expect >/dev/null 2>&1 || { apt-get update -y && apt-get install -y expect; }
+dpkg -s libpam-pwquality >/dev/null 2>&1 || { apt-get update -y && apt-get install -y libpam-pwquality; }
+
+# S'assure que pwquality est appliqué même par root
+# (root sinon peut ignorer la politique → 'BAD PASSWORD' mais mot de passe quand même changé)
+PWQ=/etc/security/pwquality.conf
+cp -an "$PWQ" "${PWQ}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true  # # Sauvegarde si existe
+grep -q '^enforce_for_root' "$PWQ" 2>/dev/null \
+  && sed -i 's/^enforce_for_root.*/enforce_for_root = 1/' "$PWQ" \
+  || echo 'enforce_for_root = 1' >> "$PWQ"
+
+# Vérifie que pam_pwquality est bien appelé par PAM
+if ! grep -q 'pam_pwquality\.so' /etc/pam.d/common-password; then
+  echo "⚠️  Attention: pam_pwquality.so n'est pas présent dans /etc/pam.d/common-password." >&2
+  echo "    Ajoute par ex.:  password requisite pam_pwquality.so retry=3" >&2
+  exit 1
+fi
+
+# --- Prépare l'utilisateur de test ------------------------------------------
+TESTUSER="pwqtest"
+BASE_OK_PW='BaseOK!2025'   # # Mot de passe initial conforme pour (re)partir propre
+
+# Crée l'utilisateur s'il n'existe pas (sans shell de connexion)
+id "$TESTUSER" >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin "$TESTUSER"
+# Pose un mot de passe initial (on accepte d'utiliser chpasswd ici pour initialiser)
+echo "${TESTUSER}:${BASE_OK_PW}" | chpasswd
+
+# --- Liste des mots de passe à tester ----------------------------------------
+# # Ajoute/retire ceux que tu veux
+PWD_LIST=(
+  "password"              # # trop simple
+  "Password123"           # # manque caractère spécial
+  "Password123!"          # # 12+ mais souvent jugé trop simple selon règles
+  "AAAAAA!!!!1111"        # # répétitions/séquences
+  "Abcdefghijkl"          # # aucune classe chifres/spéciaux
+  "Abc!12345678Xyz"       # # devrait être VALIDE
+  "UltraSecure2025!"      # # devrait être VALIDE
+)
+
+# --- Script expect inline -----------------------------------------------------
+# # On capture les messages FR/EN et on marque INVALIDE dès qu'une erreur apparait.
+EXPECT_SCRIPT=$(cat <<'EXP'
+  #!/usr/bin/expect -f
+  # args: <user> <pw1> <pw2> ...
+  set timeout 10
+  set user  [lindex $argv 0]
+  set pwlist [lrange $argv 1 end]
+
+  # # On n'affiche que nos verdicts (pas les dialogues 'passwd')
+  log_user 0
+
+  foreach pw $pwlist {
+    set verdict "INVALIDE"
+    # Lance passwd
     spawn passwd $user
-    expect "Nouveau mot de passe :"
-    send "$pw\r"
-    expect "Retapez le nouveau mot de passe :"
-    send "$pw\r"
+    expect -re "(?i)(nouveau.*mot de passe|new password).*:"
+    send -- "$pw\r"
+    expect -re "(?i)(retapez.*mot de passe|retype new password).*:"
+    send -- "$pw\r"
+
+    # Analyse des retours PAM / passwd
+    # - On marque INVALIDE si on voit des indices d'échec (too short, incorrect, dictionary...)
+    # - On passe à VALIDE uniquement si on voit 'success'.
     expect {
-        -re "incorrect" { puts "[INVALIDE] $pw" }
-        -re "succès"    { puts "[VALIDE]   $pw" }
+      -re "(?i)(incorrect|échec|too short|not long|too simple|class|repeat|sequence|diction|username|similar|palindrome|rejeté|refus|non.*conforme)" {
+        set verdict "INVALIDE"
+        exp_continue
+      }
+      -re "(?i)(mis.*succ[eè]s|updated successfully)" {
+        set verdict "VALIDE"
+      }
+      timeout {
+        # # En cas de timeout, on garde le verdict courant (par défaut INVALIDE)
+      }
     }
-}
+    # Affiche le verdict
+    puts "$verdict -> $pw"
+  }
+EXP
+)
+
+# Écrit l'expect dans un fichier temporaire et l'exécute
+TMP_EXP=/tmp/pwq_test.expect
+printf "%s\n" "$EXPECT_SCRIPT" > "$TMP_EXP"
+chmod +x "$TMP_EXP"
+
+# --- Exécution des tests ------------------------------------------------------
+"$TMP_EXP" "$TESTUSER" "${PWD_LIST[@]}"
+
+# --- Nettoyage optionnel ------------------------------------------------------
+# # Décommente si tu veux supprimer l'utilisateur de test après les essais
+# userdel -f "$TESTUSER" 2>/dev/null || true
+# passwd -l "$TESTUSER" 2>/dev/null || true   # # Alternative: simplement verrouiller le compte
+
+echo "# Fin des tests."
